@@ -4,13 +4,14 @@ import Image, time, fcntl, array, sys, os, random
 import urllib, cStringIO, errno
 import RPi.GPIO as gpio
 import cPickle as pickle
+import threading
 
 # Configurable values
 fromTop       = False
 dev           = "/dev/spidev0.0"
 skip          = 0
 skipAfter     = 18
-length        = 106 #218 #326
+length        = 92 #106 #218 #326
 displaytime   = 5
 redButton     = 14
 redButtonFile = "rose.jpg"
@@ -48,7 +49,17 @@ except OSError as exc:
     pass
   else: raise
 
+l = threading.Lock()
+display_columns = None
+display_repeating = False
+display_updated = False
+quitting = False
+
+
 def displayFile(file):
+  global display_columns
+  global display_repeating
+  global display_updated
   #file = 'povtest.png'
   repeating = "gggtiled" in file
   try:
@@ -63,7 +74,7 @@ def displayFile(file):
         cacheFile = open(cacheName, 'rb')
         columns = pickle.load(cacheFile)
         cacheFile.close()
-        width = len(columns)
+        #width = len(columns)
         #print "  cache load of %s worked!" % cacheName
       except:
         #print '  loading manually'
@@ -96,7 +107,16 @@ def displayFile(file):
         cacheFile.close()
         #print '  successfully saved cache', cacheName
 
+    l.acquire()
+    display_columns = columns
+    display_repeating = repeating
+    display_updated = True
+    print "updated display"
+    l.release()
     targettime = time.time() + displaytime
+    while time.time() < targettime:
+      time.sleep(0.1)
+    """targettime = time.time() + displaytime
     # 1330 FPS for length=326
     while time.time() < targettime:
       '''if gpio.event_detected(redButton):
@@ -110,15 +130,47 @@ def displayFile(file):
         continue
       for x in range(width):
         spidev.write(columns[width - x - 1])
-        spidev.flush()
+        spidev.flush()"""
 
     # Clear
-    spidev.write(clearBytes)
-    spidev.flush()
+    #spidev.write(clearBytes)
+    #spidev.flush()
   except IOError:
     print "%s is not a valid image" % file
 
+def display_worker():
+  global display_updated
+  while True:
+    l.acquire()
+    print "getting new columns"
+    columns = display_columns
+    repeating = display_repeating
+    l.release()
+    if columns is None:
+      time.sleep(0.1)
+      continue
+    width = len(columns)
+    while not display_updated:
+      for x in range(width):
+        spidev.write(columns[x])
+        spidev.flush()
+      if repeating:
+        continue
+      for x in range(width):
+        spidev.write(columns[width - x - 1])
+        spidev.flush()
+    display_updated = False
+    if quitting:
+      print "i'm outta here"
+      break
+
 # MAIN LOOP
+
+dw = threading.Thread(target=display_worker)
+dw.daemon = True
+dw.start()
+
+
 try:
   # 10 hours between civil twilights, and give us 15 minutes before power off.
   shutdownTime = time.time() + 60 * (60 * 10 - 15)
@@ -132,6 +184,10 @@ try:
     for file in files:
       if False and time.time() >= shutdownTime:
         print "initiating shutdown!"
+        quitting = True
+        display_updated = True
+        dw.join()
+        print "joined the worker; clearing"
         spidev.write(clearBytes)
         spidev.flush()
         os.system("sudo shutdown -h now")
@@ -141,6 +197,11 @@ try:
       displayFile(file)
 
 except KeyboardInterrupt:
+  print "initiating shutdown!"
+  quitting = True
+  display_updated = True
+  dw.join()
+  print "joined the worker; clearing"
   spidev.write(clearBytes)
   spidev.flush()
   print "\nbye"
